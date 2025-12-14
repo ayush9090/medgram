@@ -16,7 +16,7 @@ RUN npm install --production
 COPY backend/ ./
 
 # Expose port
-EXPOSE 3000
+EXPOSE 4000
 
 # Default command (can be overridden in docker-compose)
 CMD ["npm", "start"]
