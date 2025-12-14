@@ -23,8 +23,8 @@ services:
       POSTGRES_USER: medgram_admin
       POSTGRES_PASSWORD: secure_password_change_me
       POSTGRES_DB: medgram_db
-    # Port not exposed - access via nginx proxy or internal Docker network
-    # Backend and worker can access via service name 'medgram_db' on port 5432
+    # Port not exposed - only accessible within Docker network
+    # Access via nginx proxy or internal Docker network
     volumes:
       - postgres_data:/var/lib/postgresql/data
     networks:
@@ -102,10 +102,11 @@ services:
     environment:
       POSTGRES_HOST: medgram_db
       MINIO_ENDPOINT: medgram_storage
+      PORT: 4000
       # Points to your server IP so devices can access media
       MINIO_PUBLIC_URL: http://74.208.158.126:9000
     ports:
-      - "3000:3000"
+      - "4000:4000"
     networks:
       - medgram_network
     depends_on:
