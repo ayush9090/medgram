@@ -5,6 +5,7 @@ const cors = require('cors');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 const multer = require('multer');
+const nodemailer = require('nodemailer');
 
 const app = express();
 
@@ -59,6 +60,139 @@ const PRESIGNED_URL_EXPIRY = parseInt(process.env.PRESIGNED_URL_EXPIRY || '900')
 // Pagination
 const DEFAULT_PAGE_SIZE = parseInt(process.env.DEFAULT_PAGE_SIZE || '20');
 const MAX_PAGE_SIZE = parseInt(process.env.MAX_PAGE_SIZE || '50');
+
+// Email Configuration (All Dynamic)
+const SMTP_HOST = process.env.SMTP_HOST || 'smtp.gmail.com';
+const SMTP_PORT = parseInt(process.env.SMTP_PORT || '587');
+const SMTP_USER = process.env.SMTP_USER || '';
+const SMTP_PASSWORD = process.env.SMTP_PASSWORD || '';
+const SMTP_FROM = process.env.SMTP_FROM || SMTP_USER || 'noreply@medgram.com';
+const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:5173';
+
+// Email Transporter (configured dynamically)
+let emailTransporter = null;
+if (SMTP_USER && SMTP_PASSWORD) {
+  emailTransporter = nodemailer.createTransport({
+    host: SMTP_HOST,
+    port: SMTP_PORT,
+    secure: SMTP_PORT === 465, // true for 465, false for other ports
+    auth: {
+      user: SMTP_USER,
+      pass: SMTP_PASSWORD,
+    },
+  });
+  console.log(`[EMAIL] Email service configured: ${SMTP_HOST}:${SMTP_PORT}`);
+} else {
+  console.log(`[EMAIL] Email service not configured - set SMTP_USER and SMTP_PASSWORD`);
+}
+
+// Email Helper Functions
+const sendEmail = async (to, subject, html, text) => {
+  if (!emailTransporter) {
+    console.log(`[EMAIL] Email not sent - service not configured. Would send to: ${to}, Subject: ${subject}`);
+    return { success: false, message: 'Email service not configured' };
+  }
+  
+  try {
+    const info = await emailTransporter.sendMail({
+      from: `"MedGram" <${SMTP_FROM}>`,
+      to,
+      subject,
+      text,
+      html,
+    });
+    console.log(`[EMAIL] Email sent successfully to ${to}: ${info.messageId}`);
+    return { success: true, messageId: info.messageId };
+  } catch (error) {
+    console.error(`[EMAIL] Error sending email:`, error.message);
+    return { success: false, error: error.message };
+  }
+};
+
+const sendVerificationEmail = async (email, verificationCode, userId) => {
+  const verificationLink = `${FRONTEND_URL}/verify-email?code=${verificationCode}&userId=${userId}`;
+  const subject = 'Verify Your MedGram Account';
+  const html = `
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <style>
+        body { font-family: Arial, sans-serif; line-height: 1.6; color: #333; }
+        .container { max-width: 600px; margin: 0 auto; padding: 20px; }
+        .header { background: #1a1a1a; color: white; padding: 20px; text-align: center; }
+        .content { padding: 30px; background: #f9f9f9; }
+        .button { display: inline-block; padding: 12px 30px; background: #1a1a1a; color: white; text-decoration: none; border-radius: 5px; margin: 20px 0; }
+        .code { font-size: 24px; font-weight: bold; letter-spacing: 3px; color: #1a1a1a; padding: 10px; background: #e9e9e9; text-align: center; margin: 20px 0; }
+      </style>
+    </head>
+    <body>
+      <div class="container">
+        <div class="header">
+          <h1>MedGram</h1>
+          <p>Medical Education Community</p>
+        </div>
+        <div class="content">
+          <h2>Verify Your Email Address</h2>
+          <p>Thank you for registering with MedGram! Please verify your email address to complete your registration.</p>
+          
+          <p>Your verification code is:</p>
+          <div class="code">${verificationCode}</div>
+          
+          <p>Or click the button below to verify:</p>
+          <a href="${verificationLink}" class="button">Verify Email</a>
+          
+          <p>If you didn't create an account with MedGram, please ignore this email.</p>
+          <p>This verification link will expire in 24 hours.</p>
+        </div>
+      </div>
+    </body>
+    </html>
+  `;
+  const text = `Verify your MedGram account. Your verification code is: ${verificationCode}. Or visit: ${verificationLink}`;
+  
+  return await sendEmail(email, subject, html, text);
+};
+
+const sendPasswordResetEmail = async (email, resetToken) => {
+  const resetLink = `${FRONTEND_URL}/reset-password?token=${resetToken}`;
+  const subject = 'Reset Your MedGram Password';
+  const html = `
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <style>
+        body { font-family: Arial, sans-serif; line-height: 1.6; color: #333; }
+        .container { max-width: 600px; margin: 0 auto; padding: 20px; }
+        .header { background: #1a1a1a; color: white; padding: 20px; text-align: center; }
+        .content { padding: 30px; background: #f9f9f9; }
+        .button { display: inline-block; padding: 12px 30px; background: #1a1a1a; color: white; text-decoration: none; border-radius: 5px; margin: 20px 0; }
+        .warning { color: #d32f2f; font-weight: bold; }
+      </style>
+    </head>
+    <body>
+      <div class="container">
+        <div class="header">
+          <h1>MedGram</h1>
+          <p>Medical Education Community</p>
+        </div>
+        <div class="content">
+          <h2>Reset Your Password</h2>
+          <p>You requested to reset your password for your MedGram account.</p>
+          
+          <p>Click the button below to reset your password:</p>
+          <a href="${resetLink}" class="button">Reset Password</a>
+          
+          <p class="warning">If you didn't request this password reset, please ignore this email. Your password will remain unchanged.</p>
+          <p>This reset link will expire in 1 hour.</p>
+        </div>
+      </div>
+    </body>
+    </html>
+  `;
+  const text = `Reset your MedGram password. Visit: ${resetLink}`;
+  
+  return await sendEmail(email, subject, html, text);
+};
 
 // --- DATABASE CONNECTION ---
 // Connects to the 'medgram_db' container from your stack
@@ -127,7 +261,17 @@ app.post('/auth/register', async (req, res) => {
       return res.status(400).json({ error: 'User already exists' });
     }
     
-    // Verification requirements (except students and "others")
+    // Email verification - always required for email registrations
+    let emailVerified = false;
+    let emailVerificationCode = null;
+    
+    if (isEmail) {
+      // Generate email verification code
+      emailVerificationCode = Math.random().toString(36).substring(2, 10).toUpperCase();
+      console.log(`[REGISTER] Generated email verification code for ${identifier}`);
+    }
+    
+    // NPI/License verification requirements (except students and "others")
     let verified = false;
     let verificationCode = null;
     
@@ -143,7 +287,7 @@ app.post('/auth/register', async (req, res) => {
       verificationCode = Math.random().toString(36).substring(2, 8).toUpperCase();
       console.log(`[REGISTER] Generated verification code: ${verificationCode} for ${identifier}`);
     } else {
-      // Students and others don't require verification
+      // Students and others don't require NPI verification
       verified = true;
     }
     
@@ -151,9 +295,9 @@ app.post('/auth/register', async (req, res) => {
     const defaultRole = role || 'USER'; // Default to USER if not specified
     
     const result = await pool.query(
-      `INSERT INTO users (username, email, phone, password_hash, full_name, role, npi_number, state_license, avatar_url, verified, verification_code, user_type) 
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) 
-       RETURNING id, username, email, phone, role, verified, verification_code`,
+      `INSERT INTO users (username, email, phone, password_hash, full_name, role, npi_number, state_license, avatar_url, verified, verification_code, user_type, email_verified, email_verification_code, email_verification_expires) 
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15) 
+       RETURNING id, username, email, phone, role, verified, verification_code, email_verified`,
       [
         identifier, 
         isEmail ? identifier : null, // email
@@ -166,20 +310,41 @@ app.post('/auth/register', async (req, res) => {
         `https://ui-avatars.com/api/?name=${encodeURIComponent(fullName || identifier)}`, 
         verified,
         verificationCode,
-        userType || 'OTHER'
+        userType || 'OTHER',
+        emailVerified,
+        emailVerificationCode,
+        emailVerificationCode ? new Date(Date.now() + 24 * 60 * 60 * 1000) : null // 24 hours expiry
       ]
     );
     
     const user = result.rows[0];
     
-    // If verification required, don't issue token yet
+    // Send email verification if email provided
+    if (isEmail && emailVerificationCode) {
+      const emailResult = await sendVerificationEmail(identifier, emailVerificationCode, user.id);
+      if (!emailResult.success) {
+        console.log(`[REGISTER] Failed to send verification email, but user created`);
+      }
+    }
+    
+    // If NPI verification required, don't issue token yet
     if (verificationCode) {
-      console.log(`[REGISTER] User registered but requires verification. Code: ${verificationCode}`);
+      console.log(`[REGISTER] User registered but requires NPI verification. Code: ${verificationCode}`);
       return res.json({ 
         user: { ...user, password_hash: undefined },
         requiresVerification: true,
-        verificationCode: verificationCode, // In production, send via email/SMS
-        message: 'Registration pending moderator verification'
+        requiresEmailVerification: isEmail && !emailVerified,
+        verificationCode: verificationCode,
+        message: 'Registration pending verification. Please check your email for verification link.'
+      });
+    }
+    
+    // If email verification required but NPI not required
+    if (isEmail && !emailVerified) {
+      return res.json({
+        user: { ...user, password_hash: undefined },
+        requiresEmailVerification: true,
+        message: 'Please verify your email address. Check your inbox for the verification link.'
       });
     }
     
@@ -210,10 +375,19 @@ app.post('/auth/login', async (req, res) => {
       return res.status(401).json({ error: 'Invalid credentials' });
     }
     
-    // Check if user is verified (if verification was required)
+    // Check if email is verified (for email-based accounts)
+    if (user.email && !user.email_verified) {
+      return res.status(403).json({ 
+        error: 'Email not verified. Please check your email for verification link.',
+        requiresEmailVerification: true,
+        email: user.email
+      });
+    }
+    
+    // Check if user is verified (if NPI verification was required)
     if (!user.verified && user.verification_code) {
       return res.status(403).json({ 
-        error: 'Account pending verification',
+        error: 'Account pending NPI/License verification',
         requiresVerification: true 
       });
     }
@@ -253,6 +427,212 @@ const verify2FACode = async (userId, code) => {
   // For now, return true (implement with speakeasy or similar)
   return true;
 };
+
+// 2a. VERIFY EMAIL
+app.post('/auth/verify-email', async (req, res) => {
+  const { code, userId } = req.body;
+  console.log(`[VERIFY EMAIL] Verifying email for user: ${userId} with code: ${code}`);
+  
+  if (!code || !userId) {
+    return res.status(400).json({ error: 'Verification code and user ID are required' });
+  }
+  
+  try {
+    const result = await pool.query(
+      `SELECT email_verification_code, email_verification_expires, email_verified 
+       FROM users WHERE id = $1`,
+      [userId]
+    );
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    const user = result.rows[0];
+    
+    if (user.email_verified) {
+      return res.status(400).json({ error: 'Email already verified' });
+    }
+    
+    if (!user.email_verification_code) {
+      return res.status(400).json({ error: 'No pending email verification' });
+    }
+    
+    if (user.email_verification_code !== code) {
+      return res.status(400).json({ error: 'Invalid verification code' });
+    }
+    
+    if (new Date() > new Date(user.email_verification_expires)) {
+      return res.status(400).json({ error: 'Verification code has expired' });
+    }
+    
+    // Verify email
+    await pool.query(
+      'UPDATE users SET email_verified = true, email_verification_code = NULL, email_verification_expires = NULL WHERE id = $1',
+      [userId]
+    );
+    
+    console.log(`[VERIFY EMAIL] Email verified successfully for user: ${userId}`);
+    res.json({ success: true, message: 'Email verified successfully' });
+  } catch (err) {
+    console.error(`[VERIFY EMAIL] Error:`, err.message);
+    res.status(500).json({ error: 'Could not verify email' });
+  }
+});
+
+// 2b. RESEND VERIFICATION EMAIL
+app.post('/auth/resend-verification', async (req, res) => {
+  const { email } = req.body;
+  console.log(`[RESEND VERIFICATION] Resending verification email to: ${email}`);
+  
+  if (!email) {
+    return res.status(400).json({ error: 'Email is required' });
+  }
+  
+  try {
+    const result = await pool.query(
+      'SELECT id, email_verified FROM users WHERE email = $1',
+      [email]
+    );
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    const user = result.rows[0];
+    
+    if (user.email_verified) {
+      return res.status(400).json({ error: 'Email already verified' });
+    }
+    
+    // Generate new verification code
+    const emailVerificationCode = Math.random().toString(36).substring(2, 10).toUpperCase();
+    
+    await pool.query(
+      `UPDATE users SET email_verification_code = $1, email_verification_expires = $2 WHERE id = $3`,
+      [emailVerificationCode, new Date(Date.now() + 24 * 60 * 60 * 1000), user.id]
+    );
+    
+    // Send verification email
+    const emailResult = await sendVerificationEmail(email, emailVerificationCode, user.id);
+    
+    if (emailResult.success) {
+      console.log(`[RESEND VERIFICATION] Verification email sent successfully`);
+      res.json({ success: true, message: 'Verification email sent successfully' });
+    } else {
+      res.status(500).json({ error: 'Failed to send verification email', details: emailResult.error });
+    }
+  } catch (err) {
+    console.error(`[RESEND VERIFICATION] Error:`, err.message);
+    res.status(500).json({ error: 'Could not resend verification email' });
+  }
+});
+
+// 2c. REQUEST PASSWORD RESET
+app.post('/auth/forgot-password', async (req, res) => {
+  const { email } = req.body;
+  console.log(`[FORGOT PASSWORD] Password reset requested for: ${email}`);
+  
+  if (!email) {
+    return res.status(400).json({ error: 'Email is required' });
+  }
+  
+  try {
+    const result = await pool.query(
+      'SELECT id FROM users WHERE email = $1',
+      [email]
+    );
+    
+    if (result.rows.length === 0) {
+      // Don't reveal if email exists for security
+      return res.json({ success: true, message: 'If the email exists, a password reset link has been sent' });
+    }
+    
+    const userId = result.rows[0].id;
+    
+    // Generate reset token (expires in 1 hour)
+    const resetToken = jwt.sign({ userId, type: 'password_reset' }, JWT_SECRET, { expiresIn: '1h' });
+    
+    // Store reset token in database
+    await pool.query(
+      'UPDATE users SET password_reset_token = $1, password_reset_expires = $2 WHERE id = $3',
+      [resetToken, new Date(Date.now() + 60 * 60 * 1000), userId]
+    );
+    
+    // Send password reset email
+    const emailResult = await sendPasswordResetEmail(email, resetToken);
+    
+    if (emailResult.success) {
+      console.log(`[FORGOT PASSWORD] Password reset email sent successfully`);
+      res.json({ success: true, message: 'Password reset link sent to your email' });
+    } else {
+      res.status(500).json({ error: 'Failed to send password reset email' });
+    }
+  } catch (err) {
+    console.error(`[FORGOT PASSWORD] Error:`, err.message);
+    res.status(500).json({ error: 'Could not process password reset request' });
+  }
+});
+
+// 2d. RESET PASSWORD
+app.post('/auth/reset-password', async (req, res) => {
+  const { token, newPassword } = req.body;
+  console.log(`[RESET PASSWORD] Password reset attempt`);
+  
+  if (!token || !newPassword) {
+    return res.status(400).json({ error: 'Token and new password are required' });
+  }
+  
+  if (newPassword.length < 6) {
+    return res.status(400).json({ error: 'Password must be at least 6 characters' });
+  }
+  
+  try {
+    // Verify token
+    let decoded;
+    try {
+      decoded = jwt.verify(token, JWT_SECRET);
+      if (decoded.type !== 'password_reset') {
+        return res.status(400).json({ error: 'Invalid token type' });
+      }
+    } catch (err) {
+      return res.status(400).json({ error: 'Invalid or expired reset token' });
+    }
+    
+    // Check if token exists in database and not expired
+    const result = await pool.query(
+      'SELECT id, password_reset_token, password_reset_expires FROM users WHERE id = $1',
+      [decoded.userId]
+    );
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    const user = result.rows[0];
+    
+    if (user.password_reset_token !== token) {
+      return res.status(400).json({ error: 'Invalid reset token' });
+    }
+    
+    if (new Date() > new Date(user.password_reset_expires)) {
+      return res.status(400).json({ error: 'Reset token has expired' });
+    }
+    
+    // Update password
+    const hashedPassword = await bcrypt.hash(newPassword, 10);
+    await pool.query(
+      'UPDATE users SET password_hash = $1, password_reset_token = NULL, password_reset_expires = NULL WHERE id = $2',
+      [hashedPassword, decoded.userId]
+    );
+    
+    console.log(`[RESET PASSWORD] Password reset successfully for user: ${decoded.userId}`);
+    res.json({ success: true, message: 'Password reset successfully' });
+  } catch (err) {
+    console.error(`[RESET PASSWORD] Error:`, err.message);
+    res.status(500).json({ error: 'Could not reset password' });
+  }
+});
 
 // 3. GET FEED (with pagination and filtering)
 app.get('/feed', async (req, res) => {
@@ -514,14 +894,16 @@ app.get('/health', async (req, res) => {
   }
 });
 
-// 7. GET USER PROFILE
+// 7. GET USER PROFILE (with stats)
 app.get('/users/:id', async (req, res) => {
   const { id } = req.params;
   console.log(`[USER PROFILE] Fetching profile for user: ${id}`);
   
   try {
     const result = await pool.query(
-      'SELECT id, username, full_name, role, avatar_url, verified, created_at FROM users WHERE id = $1',
+      `SELECT id, username, email, phone, full_name, role, avatar_url, verified, created_at, 
+              npi_number, state_license, user_type
+       FROM users WHERE id = $1`,
       [id]
     );
     
@@ -530,11 +912,94 @@ app.get('/users/:id', async (req, res) => {
       return res.status(404).json({ error: 'User not found' });
     }
     
-    console.log(`[USER PROFILE] Profile retrieved for: ${result.rows[0].username}`);
-    res.json(result.rows[0]);
+    const user = result.rows[0];
+    
+    // Get dynamic stats
+    const [postsCount, followersCount, followingCount] = await Promise.all([
+      pool.query('SELECT COUNT(*) as count FROM posts WHERE user_id = $1 AND (processing_status = \'COMPLETED\' OR processing_status IS NULL)', [id]),
+      pool.query('SELECT COUNT(*) as count FROM follows WHERE following_id = $1', [id]), // Assuming follows table
+      pool.query('SELECT COUNT(*) as count FROM follows WHERE follower_id = $1', [id])
+    ]);
+    
+    const profile = {
+      ...user,
+      stats: {
+        posts: parseInt(postsCount.rows[0].count),
+        followers: parseInt(followersCount.rows[0].count),
+        following: parseInt(followingCount.rows[0].count)
+      }
+    };
+    
+    console.log(`[USER PROFILE] Profile retrieved for: ${user.username}`);
+    res.json(profile);
   } catch (err) {
     console.error(`[USER PROFILE] Error:`, err.message);
     res.status(500).json({ error: 'Could not fetch user profile' });
+  }
+});
+
+// 7b. UPDATE USER PROFILE (auth required)
+app.put('/users/:id', authenticate, async (req, res) => {
+  const { id: userId } = req.params;
+  const { fullName, avatarUrl, bio, email, phone } = req.body;
+  
+  // Users can only update their own profile (or moderators can update any)
+  if (userId !== req.user.id && req.user.role !== 'MODERATOR') {
+    return res.status(403).json({ error: 'Permission denied' });
+  }
+  
+  console.log(`[UPDATE PROFILE] User ${req.user.id} updating profile for: ${userId}`);
+  
+  try {
+    const updates = [];
+    const values = [];
+    let paramCount = 1;
+    
+    if (fullName !== undefined) {
+      updates.push(`full_name = $${paramCount}`);
+      values.push(fullName);
+      paramCount++;
+    }
+    
+    if (avatarUrl !== undefined) {
+      updates.push(`avatar_url = $${paramCount}`);
+      values.push(avatarUrl);
+      paramCount++;
+    }
+    
+    if (email !== undefined) {
+      updates.push(`email = $${paramCount}`);
+      values.push(email);
+      paramCount++;
+    }
+    
+    if (phone !== undefined) {
+      updates.push(`phone = $${paramCount}`);
+      values.push(phone);
+      paramCount++;
+    }
+    
+    if (bio !== undefined) {
+      // Store bio in a separate field or use a JSON field
+      updates.push(`bio = $${paramCount}`);
+      values.push(bio);
+      paramCount++;
+    }
+    
+    if (updates.length === 0) {
+      return res.status(400).json({ error: 'No fields to update' });
+    }
+    
+    values.push(userId);
+    const query = `UPDATE users SET ${updates.join(', ')} WHERE id = $${paramCount} RETURNING id, username, email, phone, full_name, role, avatar_url, verified, bio`;
+    
+    const result = await pool.query(query, values);
+    
+    console.log(`[UPDATE PROFILE] Profile updated successfully for user: ${userId}`);
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error(`[UPDATE PROFILE] Error:`, err.message);
+    res.status(500).json({ error: 'Could not update profile' });
   }
 });
 
@@ -1069,6 +1534,13 @@ const initDb = async () => {
                 is_external BOOLEAN DEFAULT FALSE,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
+            CREATE TABLE IF NOT EXISTS follows (
+                follower_id UUID REFERENCES users(id) ON DELETE CASCADE,
+                following_id UUID REFERENCES users(id) ON DELETE CASCADE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (follower_id, following_id)
+            );
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS bio TEXT;
             ALTER TABLE users ADD COLUMN IF NOT EXISTS email VARCHAR(255);
             ALTER TABLE users ADD COLUMN IF NOT EXISTS phone VARCHAR(50);
             ALTER TABLE users ADD COLUMN IF NOT EXISTS state_license VARCHAR(50);
@@ -1076,6 +1548,11 @@ const initDb = async () => {
             ALTER TABLE users ADD COLUMN IF NOT EXISTS user_type VARCHAR(20);
             ALTER TABLE users ADD COLUMN IF NOT EXISTS two_factor_enabled BOOLEAN DEFAULT FALSE;
             ALTER TABLE users ADD COLUMN IF NOT EXISTS two_factor_secret VARCHAR(255);
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified BOOLEAN DEFAULT FALSE;
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verification_code VARCHAR(10);
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verification_expires TIMESTAMP;
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS password_reset_token VARCHAR(500);
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS password_reset_expires TIMESTAMP;
             CREATE INDEX IF NOT EXISTS idx_comments_post_id ON comments(post_id);
             CREATE INDEX IF NOT EXISTS idx_posts_user_id ON posts(user_id);
             CREATE INDEX IF NOT EXISTS idx_posts_type ON posts(type);
@@ -1103,8 +1580,12 @@ app.listen(PORT, '0.0.0.0', async () => {
     console.log(`  HLS Bucket: ${MINIO_HLS_BUCKET}`);
     console.log(`  Max File Size: ${MAX_FILE_SIZE / 1024 / 1024}MB`);
     console.log(`[SERVER] Available endpoints:`);
-    console.log(`  POST   /auth/register (email/phone, NPI/License verification)`);
+    console.log(`  POST   /auth/register (email/phone, NPI/License verification, email verification)`);
     console.log(`  POST   /auth/login (email/phone, 2FA support)`);
+    console.log(`  POST   /auth/verify-email (verify email address)`);
+    console.log(`  POST   /auth/resend-verification (resend verification email)`);
+    console.log(`  POST   /auth/forgot-password (request password reset)`);
+    console.log(`  POST   /auth/reset-password (reset password with token)`);
     console.log(`  GET    /feed (with pagination)`);
     console.log(`  POST   /posts (auth required, role-based permissions)`);
     console.log(`  DELETE /posts/:id (auth required)`);
