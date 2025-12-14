@@ -200,8 +200,9 @@ const initDb = async () => {
 }
 
 // Start Server
-const PORT = 3000;
-app.listen(PORT, async () => {
+const PORT = process.env.PORT || 4000;
+console.log(`Starting server on port: ${PORT} (from env: ${process.env.PORT || 'default 4000'})`);
+app.listen(PORT, '0.0.0.0', async () => {
     console.log(`Backend running on port ${PORT}`);
     // Wait a bit for DB to be ready in Docker
     setTimeout(initDb, 5000);
