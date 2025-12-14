@@ -151,6 +151,25 @@ services:
   #     medgram_backend:
   #       condition: service_started
 
+  # 7. pgAdmin - Web-based PostgreSQL Administration Tool
+  medgram_pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: medgram_pgadmin
+    restart: always
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@medgram.com
+      PGADMIN_DEFAULT_PASSWORD: admin123
+      PGADMIN_CONFIG_SERVER_MODE: 'False'
+    ports:
+      - "5050:80"
+    networks:
+      - medgram_network
+    depends_on:
+      medgram_db:
+        condition: service_healthy
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+
 networks:
   medgram_network:
     name: medgram_network
@@ -159,4 +178,5 @@ networks:
 volumes:
   postgres_data:
   minio_data:
+  pgadmin_data:
 
