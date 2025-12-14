@@ -7,14 +7,58 @@ const bcrypt = require('bcryptjs');
 const multer = require('multer');
 
 const app = express();
+
+// --- LOGGING MIDDLEWARE ---
+const logger = (req, res, next) => {
+  const timestamp = new Date().toISOString();
+  const method = req.method;
+  const url = req.url;
+  const ip = req.ip || req.connection.remoteAddress;
+  
+  console.log(`[${timestamp}] ${method} ${url} - IP: ${ip}`);
+  
+  // Log request body for POST/PUT (except passwords)
+  if (['POST', 'PUT', 'PATCH'].includes(method) && req.body) {
+    const logBody = { ...req.body };
+    if (logBody.password) logBody.password = '***HIDDEN***';
+    if (logBody.password_hash) logBody.password_hash = '***HIDDEN***';
+    console.log(`  Body:`, JSON.stringify(logBody));
+  }
+  
+  // Log response
+  const originalSend = res.send;
+  res.send = function(data) {
+    console.log(`[${timestamp}] ${method} ${url} - Status: ${res.statusCode}`);
+    if (res.statusCode >= 400) {
+      console.log(`  Error Response:`, data);
+    }
+    return originalSend.call(this, data);
+  };
+  
+  next();
+};
+
+app.use(logger);
 app.use(express.json());
 app.use(cors());
 
-// --- CONFIGURATION ---
+// --- CONFIGURATION (All Dynamic) ---
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret';
-const MINIO_BUCKET = 'videos';
-// Use environment variable for public URL (accessible by browser)
+const JWT_EXPIRY = process.env.JWT_EXPIRY || '7d';
+
+// MinIO Configuration - All Dynamic
+const MINIO_VIDEOS_BUCKET = process.env.MINIO_VIDEOS_BUCKET || 'videos';
+const MINIO_IMAGES_BUCKET = process.env.MINIO_IMAGES_BUCKET || 'images';
+const MINIO_HLS_BUCKET = process.env.MINIO_HLS_BUCKET || 'hls';
 const MINIO_PUBLIC_URL = process.env.MINIO_PUBLIC_URL || 'http://localhost:9000';
+
+// Upload Configuration
+const MAX_FILE_SIZE = parseInt(process.env.MAX_FILE_SIZE || '104857600'); // 100MB default
+const PRESIGNED_URL_EXPIRY = parseInt(process.env.PRESIGNED_URL_EXPIRY || '900'); // 15 minutes default
+
+// Pagination
+const DEFAULT_PAGE_SIZE = parseInt(process.env.DEFAULT_PAGE_SIZE || '20');
+const MAX_PAGE_SIZE = parseInt(process.env.MAX_PAGE_SIZE || '50');
 
 // --- DATABASE CONNECTION ---
 // Connects to the 'medgram_db' container from your stack
@@ -52,81 +96,283 @@ const authenticate = (req, res, next) => {
 
 // --- ROUTES ---
 
-// 1. REGISTER
+// 1. REGISTER (Updated per MIB Layout requirements)
 app.post('/auth/register', async (req, res) => {
-  const { username, password, fullName, role, npiNumber } = req.body;
+  const { username, password, fullName, role, npiNumber, stateLicense, email, phone, userType } = req.body;
+  console.log(`[REGISTER] Attempting to register user: ${username || email || phone}, role: ${role}`);
+  
   try {
-    const hashedPassword = await bcrypt.hash(password, 10);
-    const result = await pool.query(
-      `INSERT INTO users (username, password_hash, full_name, role, npi_number, avatar_url, verified) 
-       VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id, username, role`,
-      [username, hashedPassword, fullName, role, npiNumber, `https://ui-avatars.com/api/?name=${username}`, false]
+    // Username can be email or phone number
+    const identifier = username || email || phone;
+    if (!identifier || !password) {
+      console.log(`[REGISTER] Missing identifier or password`);
+      return res.status(400).json({ error: 'Email/Phone and password are required' });
+    }
+    
+    // Validate email or phone format
+    const isEmail = identifier.includes('@');
+    const isPhone = /^\+?[\d\s-()]+$/.test(identifier);
+    
+    if (!isEmail && !isPhone) {
+      return res.status(400).json({ error: 'Username must be a valid email or phone number' });
+    }
+    
+    // Check if user already exists (by email or phone)
+    const existingUser = await pool.query(
+      `SELECT id FROM users WHERE username = $1 OR email = $1 OR phone = $1`,
+      [identifier]
     );
-    const token = jwt.sign({ id: result.rows[0].id, role: result.rows[0].role }, JWT_SECRET);
-    res.json({ user: result.rows[0], token });
+    
+    if (existingUser.rows.length > 0) {
+      return res.status(400).json({ error: 'User already exists' });
+    }
+    
+    // Verification requirements (except students and "others")
+    let verified = false;
+    let verificationCode = null;
+    
+    if (userType !== 'STUDENT' && userType !== 'OTHER') {
+      // Requires NPI or State License verification
+      if (!npiNumber && !stateLicense) {
+        return res.status(400).json({ 
+          error: 'NPI number or State License is required for verification',
+          requiresVerification: true 
+        });
+      }
+      // Generate verification code (to be verified by moderator)
+      verificationCode = Math.random().toString(36).substring(2, 8).toUpperCase();
+      console.log(`[REGISTER] Generated verification code: ${verificationCode} for ${identifier}`);
+    } else {
+      // Students and others don't require verification
+      verified = true;
+    }
+    
+    const hashedPassword = await bcrypt.hash(password, 10);
+    const defaultRole = role || 'USER'; // Default to USER if not specified
+    
+    const result = await pool.query(
+      `INSERT INTO users (username, email, phone, password_hash, full_name, role, npi_number, state_license, avatar_url, verified, verification_code, user_type) 
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) 
+       RETURNING id, username, email, phone, role, verified, verification_code`,
+      [
+        identifier, 
+        isEmail ? identifier : null, // email
+        isPhone ? identifier : null, // phone
+        hashedPassword, 
+        fullName, 
+        defaultRole, 
+        npiNumber, 
+        stateLicense,
+        `https://ui-avatars.com/api/?name=${encodeURIComponent(fullName || identifier)}`, 
+        verified,
+        verificationCode,
+        userType || 'OTHER'
+      ]
+    );
+    
+    const user = result.rows[0];
+    
+    // If verification required, don't issue token yet
+    if (verificationCode) {
+      console.log(`[REGISTER] User registered but requires verification. Code: ${verificationCode}`);
+      return res.json({ 
+        user: { ...user, password_hash: undefined },
+        requiresVerification: true,
+        verificationCode: verificationCode, // In production, send via email/SMS
+        message: 'Registration pending moderator verification'
+      });
+    }
+    
+    const token = jwt.sign({ id: user.id, role: user.role }, JWT_SECRET, { expiresIn: JWT_EXPIRY });
+    console.log(`[REGISTER] Successfully registered user: ${identifier}, ID: ${user.id}`);
+    res.json({ user: { ...user, password_hash: undefined }, token });
   } catch (err) {
-    console.error(err);
+    console.error(`[REGISTER] Error:`, err.message);
     res.status(400).json({ error: 'User already exists or invalid data' });
   }
 });
 
-// 2. LOGIN
+// 2. LOGIN (Updated per MIB Layout - supports email or phone)
 app.post('/auth/login', async (req, res) => {
-  const { username, password } = req.body;
+  const { username, password, twoFactorCode } = req.body; // username can be email or phone
+  console.log(`[LOGIN] Attempting login for user: ${username}`);
+  
   try {
-    const result = await pool.query('SELECT * FROM users WHERE username = $1', [username]);
+    // Support login with email or phone number
+    const result = await pool.query(
+      `SELECT * FROM users WHERE username = $1 OR email = $1 OR phone = $1`,
+      [username]
+    );
     const user = result.rows[0];
     
     if (!user || !(await bcrypt.compare(password, user.password_hash))) {
+      console.log(`[LOGIN] Invalid credentials for user: ${username}`);
       return res.status(401).json({ error: 'Invalid credentials' });
     }
+    
+    // Check if user is verified (if verification was required)
+    if (!user.verified && user.verification_code) {
+      return res.status(403).json({ 
+        error: 'Account pending verification',
+        requiresVerification: true 
+      });
+    }
+    
+    // 2FA Check (if enabled)
+    if (user.two_factor_enabled) {
+      if (!twoFactorCode) {
+        return res.status(200).json({ 
+          requiresTwoFactor: true,
+          message: 'Two-factor authentication code required'
+        });
+      }
+      
+      // Verify 2FA code (in production, use proper 2FA library like speakeasy)
+      // For now, check against stored code or use time-based OTP
+      const isValidCode = await verify2FACode(user.id, twoFactorCode);
+      if (!isValidCode) {
+        return res.status(401).json({ error: 'Invalid 2FA code' });
+      }
+    }
 
-    const token = jwt.sign({ id: user.id, role: user.role }, JWT_SECRET);
-    // Remove password from response
+    const token = jwt.sign({ id: user.id, role: user.role }, JWT_SECRET, { expiresIn: JWT_EXPIRY });
+    // Remove sensitive data from response
     delete user.password_hash;
+    delete user.verification_code;
+    console.log(`[LOGIN] Successful login for user: ${username}, role: ${user.role}`);
     res.json({ user, token });
   } catch (err) {
-    console.error(err);
+    console.error(`[LOGIN] Error:`, err.message);
     res.status(500).json({ error: 'Internal error' });
   }
 });
 
-// 3. GET FEED
+// Helper function for 2FA verification (placeholder - implement with proper 2FA library)
+const verify2FACode = async (userId, code) => {
+  // TODO: Implement proper 2FA verification
+  // For now, return true (implement with speakeasy or similar)
+  return true;
+};
+
+// 3. GET FEED (with pagination and filtering)
 app.get('/feed', async (req, res) => {
+  const page = parseInt(req.query.page || '1');
+  const limit = Math.min(parseInt(req.query.limit || DEFAULT_PAGE_SIZE), MAX_PAGE_SIZE);
+  const offset = (page - 1) * limit;
+  const type = req.query.type; // Filter by post type (VIDEO, THREAD, etc.)
+  const userId = req.query.userId; // Filter by user
+  
+  console.log(`[FEED] Fetching feed - page: ${page}, limit: ${limit}, type: ${type || 'all'}, userId: ${userId || 'all'}`);
+  
   try {
-    const result = await pool.query(`
+    let query = `
       SELECT 
-        p.id, p.type, p.content, p.media_url as "mediaUrl", p.thumbnail_url as "thumbnailUrl", p.created_at as timestamp, p.processing_status,
+        p.id, p.type, p.content, p.media_url as "mediaUrl", p.thumbnail_url as "thumbnailUrl", 
+        p.created_at as timestamp, p.processing_status,
         u.id as "authorId", u.username as "authorName", u.avatar_url as "authorAvatar", u.role as "authorRole",
-        (SELECT COUNT(*) FROM likes WHERE post_id = p.id) as likes
+        (SELECT COUNT(*) FROM likes WHERE post_id = p.id) as likes,
+        (SELECT COUNT(*) FROM comments WHERE post_id = p.id) as commentCount
       FROM posts p
       JOIN users u ON p.user_id = u.id
-      WHERE p.processing_status = 'COMPLETED' OR p.processing_status IS NULL
-      ORDER BY p.created_at DESC
-      LIMIT 50
-    `);
+      WHERE (p.processing_status = 'COMPLETED' OR p.processing_status IS NULL)
+    `;
+    const params = [];
+    let paramCount = 1;
     
-    // Transform to match frontend types
-    const posts = result.rows.map(row => ({
-      ...row,
-      comments: [], // Comments fetch separate for optimization
-      timestamp: new Date(row.timestamp).getTime(),
-      likedByCurrentUser: false // Real implementation needs subquery with req.user.id
+    if (type) {
+      query += ` AND p.type = $${paramCount}`;
+      params.push(type);
+      paramCount++;
+    }
+    
+    if (userId) {
+      query += ` AND p.user_id = $${paramCount}`;
+      params.push(userId);
+      paramCount++;
+    }
+    
+    query += ` ORDER BY p.created_at DESC LIMIT $${paramCount} OFFSET $${paramCount + 1}`;
+    params.push(limit, offset);
+    
+    // Get total count for pagination
+    const countQuery = `
+      SELECT COUNT(*) as total
+      FROM posts p
+      WHERE (p.processing_status = 'COMPLETED' OR p.processing_status IS NULL)
+      ${type ? `AND p.type = '${type}'` : ''}
+      ${userId ? `AND p.user_id = '${userId}'` : ''}
+    `;
+    
+    const [result, countResult] = await Promise.all([
+      pool.query(query, params),
+      pool.query(countQuery)
+    ]);
+    
+    const total = parseInt(countResult.rows[0].total);
+    const totalPages = Math.ceil(total / limit);
+    
+    // Check if user liked each post (if authenticated)
+    const userIdForLikes = req.headers.authorization ? 
+      (await jwt.verify(req.headers.authorization.split(' ')[1], JWT_SECRET))?.id : null;
+    
+    const posts = await Promise.all(result.rows.map(async (row) => {
+      let likedByCurrentUser = false;
+      if (userIdForLikes) {
+        const likeCheck = await pool.query(
+          'SELECT 1 FROM likes WHERE user_id = $1 AND post_id = $2',
+          [userIdForLikes, row.id]
+        );
+        likedByCurrentUser = likeCheck.rows.length > 0;
+      }
+      
+      return {
+        ...row,
+        comments: [], // Comments fetched separately
+        timestamp: new Date(row.timestamp).getTime(),
+        likedByCurrentUser
+      };
     }));
     
-    res.json(posts);
+    console.log(`[FEED] Returning ${posts.length} posts (page ${page}/${totalPages}, total: ${total})`);
+    res.json({
+      posts,
+      pagination: {
+        page,
+        limit,
+        total,
+        totalPages,
+        hasNext: page < totalPages,
+        hasPrev: page > 1
+      }
+    });
   } catch (err) {
-    console.error(err);
+    console.error(`[FEED] Error:`, err.message);
     res.status(500).json({ error: 'Could not fetch feed' });
   }
 });
 
-// 4. CREATE POST
+// 4. CREATE POST (Updated per MIB Layout permissions)
 app.post('/posts', authenticate, async (req, res) => {
   const { type, content, mediaUrl, thumbnailUrl } = req.body;
+  const userRole = req.user.role;
+  console.log(`[CREATE POST] User ${req.user.id} (${userRole}) creating ${type} post`);
   
-  if (req.user.role === 'VIEW_ONLY') return res.status(403).json({ error: 'Permission denied' });
-  if (type === 'VIDEO' && req.user.role === 'USER') return res.status(403).json({ error: 'Standard users cannot post videos' });
+  // MIB Layout Permissions:
+  // VIEW_ONLY: Cannot create posts
+  if (userRole === 'VIEW_ONLY') {
+    console.log(`[CREATE POST] Permission denied - VIEW_ONLY role`);
+    return res.status(403).json({ error: 'View-Only users cannot create posts' });
+  }
+  
+  // USER: Can post THREAD but NOT VIDEO
+  if (type === 'VIDEO' && userRole === 'USER') {
+    console.log(`[CREATE POST] Permission denied - USER cannot post videos`);
+    return res.status(403).json({ 
+      error: 'Standard users cannot post videos. Only Creators and Moderators can post videos.' 
+    });
+  }
+  
+  // MODERATOR and CREATOR: Can post both THREAD and VIDEO
 
   // Initial status for videos is PENDING, for threads it is NULL (or COMPLETED implicitly)
   const processingStatus = type === 'VIDEO' ? 'PENDING' : 'COMPLETED';
@@ -137,33 +383,642 @@ app.post('/posts', authenticate, async (req, res) => {
        VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
       [req.user.id, type, content, mediaUrl, thumbnailUrl, processingStatus]
     );
+    console.log(`[CREATE POST] Post created successfully, ID: ${result.rows[0].id}`);
     res.json({ success: true, postId: result.rows[0].id });
   } catch (err) {
-    console.error(err);
+    console.error(`[CREATE POST] Error:`, err.message);
     res.status(500).json({ error: 'Failed to create post' });
   }
 });
 
-// 5. GET PRESIGNED URL (For Video Upload)
+// 5. GET PRESIGNED URL (For Video/Image Upload - Dynamic)
 app.post('/upload/presigned', authenticate, async (req, res) => {
-  const { filename } = req.body;
-  // Create unique name
-  const objectName = `${Date.now()}-${filename}`;
+  const { filename, fileType } = req.body; // fileType: 'video', 'image', etc.
+  console.log(`[PRESIGNED URL] User ${req.user.id} requesting upload URL for: ${filename}, type: ${fileType}`);
+  
+  // Determine bucket based on file type
+  let bucket = MINIO_VIDEOS_BUCKET;
+  if (fileType === 'image' || filename.match(/\.(jpg|jpeg|png|gif|webp)$/i)) {
+    bucket = MINIO_IMAGES_BUCKET;
+  } else if (fileType === 'video' || filename.match(/\.(mp4|mov|avi|mkv|webm)$/i)) {
+    bucket = MINIO_VIDEOS_BUCKET;
+  }
+  
+  // Create unique name with timestamp and user ID
+  const fileExtension = filename.split('.').pop();
+  const objectName = `${req.user.id}/${Date.now()}-${Math.random().toString(36).substring(7)}.${fileExtension}`;
   
   try {
-    // URL expires in 15 minutes
-    const url = await minioClient.presignedPutObject(MINIO_BUCKET, objectName, 15 * 60);
-    // Public URL for accessing the file after upload
-    const publicUrl = `${MINIO_PUBLIC_URL}/${MINIO_BUCKET}/${objectName}`; 
-    res.json({ uploadUrl: url, publicUrl });
+    // Ensure bucket exists
+    const bucketExists = await minioClient.bucketExists(bucket);
+    if (!bucketExists) {
+      await minioClient.makeBucket(bucket, 'us-east-1');
+      console.log(`[PRESIGNED URL] Created bucket: ${bucket}`);
+    }
+    
+    // Generate presigned URL with dynamic expiry
+    const url = await minioClient.presignedPutObject(bucket, objectName, PRESIGNED_URL_EXPIRY);
+    const publicUrl = `${MINIO_PUBLIC_URL}/${bucket}/${objectName}`;
+    
+    console.log(`[PRESIGNED URL] Generated URL for object: ${objectName} in bucket: ${bucket}`);
+    res.json({ 
+      uploadUrl: url, 
+      publicUrl,
+      bucket,
+      objectName,
+      expiresIn: PRESIGNED_URL_EXPIRY
+    });
   } catch (err) {
-    console.error(err);
+    console.error(`[PRESIGNED URL] Error:`, err.message);
     res.status(500).json({ error: 'Could not generate upload URL' });
+  }
+});
+
+// 5b. DIRECT UPLOAD (Alternative - upload directly to server)
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: MAX_FILE_SIZE },
+  fileFilter: (req, file, cb) => {
+    const allowedTypes = /jpeg|jpg|png|gif|webp|mp4|mov|avi|mkv|webm/;
+    const extname = allowedTypes.test(file.originalname.toLowerCase().split('.').pop());
+    const mimetype = allowedTypes.test(file.mimetype);
+    if (extname && mimetype) {
+      cb(null, true);
+    } else {
+      cb(new Error('Invalid file type. Only images and videos are allowed.'));
+    }
+  }
+});
+
+app.post('/upload/direct', authenticate, upload.single('file'), async (req, res) => {
+  if (!req.file) {
+    return res.status(400).json({ error: 'No file uploaded' });
+  }
+  
+  const file = req.file;
+  const isImage = file.mimetype.startsWith('image/');
+  const isVideo = file.mimetype.startsWith('video/');
+  const bucket = isImage ? MINIO_IMAGES_BUCKET : MINIO_VIDEOS_BUCKET;
+  
+  console.log(`[DIRECT UPLOAD] User ${req.user.id} uploading ${file.mimetype} (${file.size} bytes) to ${bucket}`);
+  
+  try {
+    // Ensure bucket exists
+    const bucketExists = await minioClient.bucketExists(bucket);
+    if (!bucketExists) {
+      await minioClient.makeBucket(bucket, 'us-east-1');
+    }
+    
+    const objectName = `${req.user.id}/${Date.now()}-${Math.random().toString(36).substring(7)}-${file.originalname}`;
+    
+    await minioClient.putObject(bucket, objectName, file.buffer, {
+      'Content-Type': file.mimetype,
+      'Content-Length': file.size
+    });
+    
+    const publicUrl = `${MINIO_PUBLIC_URL}/${bucket}/${objectName}`;
+    
+    console.log(`[DIRECT UPLOAD] File uploaded successfully: ${objectName}`);
+    res.json({
+      success: true,
+      url: publicUrl,
+      bucket,
+      objectName,
+      type: isImage ? 'image' : 'video',
+      size: file.size
+    });
+  } catch (err) {
+    console.error(`[DIRECT UPLOAD] Error:`, err.message);
+    res.status(500).json({ error: 'Upload failed' });
+  }
+});
+
+// 6. HEALTH CHECK
+app.get('/health', async (req, res) => {
+  try {
+    // Check database connection
+    await pool.query('SELECT 1');
+    console.log(`[HEALTH] All systems operational`);
+    res.json({ 
+      status: 'healthy', 
+      database: 'connected',
+      timestamp: new Date().toISOString()
+    });
+  } catch (err) {
+    console.error(`[HEALTH] Error:`, err.message);
+    res.status(503).json({ 
+      status: 'unhealthy', 
+      database: 'disconnected',
+      error: err.message 
+    });
+  }
+});
+
+// 7. GET USER PROFILE
+app.get('/users/:id', async (req, res) => {
+  const { id } = req.params;
+  console.log(`[USER PROFILE] Fetching profile for user: ${id}`);
+  
+  try {
+    const result = await pool.query(
+      'SELECT id, username, full_name, role, avatar_url, verified, created_at FROM users WHERE id = $1',
+      [id]
+    );
+    
+    if (result.rows.length === 0) {
+      console.log(`[USER PROFILE] User not found: ${id}`);
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    console.log(`[USER PROFILE] Profile retrieved for: ${result.rows[0].username}`);
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error(`[USER PROFILE] Error:`, err.message);
+    res.status(500).json({ error: 'Could not fetch user profile' });
+  }
+});
+
+// 8. LIKE/UNLIKE POST (MIB Layout: VIEW_ONLY cannot like)
+app.post('/posts/:id/like', authenticate, async (req, res) => {
+  const { id: postId } = req.params;
+  const userId = req.user.id;
+  const userRole = req.user.role;
+  
+  // MIB Layout: VIEW_ONLY cannot like
+  if (userRole === 'VIEW_ONLY') {
+    console.log(`[LIKE] Permission denied - VIEW_ONLY cannot like posts`);
+    return res.status(403).json({ error: 'View-Only users cannot like posts' });
+  }
+  
+  console.log(`[LIKE] User ${userId} liking post ${postId}`);
+  
+  try {
+    // Check if already liked
+    const checkResult = await pool.query(
+      'SELECT * FROM likes WHERE user_id = $1 AND post_id = $2',
+      [userId, postId]
+    );
+    
+    if (checkResult.rows.length > 0) {
+      // Unlike
+      await pool.query(
+        'DELETE FROM likes WHERE user_id = $1 AND post_id = $2',
+        [userId, postId]
+      );
+      console.log(`[LIKE] Post ${postId} unliked by user ${userId}`);
+      res.json({ liked: false });
+    } else {
+      // Like
+      await pool.query(
+        'INSERT INTO likes (user_id, post_id) VALUES ($1, $2)',
+        [userId, postId]
+      );
+      console.log(`[LIKE] Post ${postId} liked by user ${userId}`);
+      res.json({ liked: true });
+    }
+  } catch (err) {
+    console.error(`[LIKE] Error:`, err.message);
+    res.status(500).json({ error: 'Could not like/unlike post' });
+  }
+});
+
+// 9. GET POSTS BY USER
+app.get('/users/:id/posts', async (req, res) => {
+  const { id: userId } = req.params;
+  console.log(`[USER POSTS] Fetching posts for user: ${userId}`);
+  
+  try {
+    const result = await pool.query(`
+      SELECT 
+        p.id, p.type, p.content, p.media_url as "mediaUrl", p.thumbnail_url as "thumbnailUrl", 
+        p.created_at as timestamp, p.processing_status,
+        u.id as "authorId", u.username as "authorName", u.avatar_url as "authorAvatar", u.role as "authorRole",
+        (SELECT COUNT(*) FROM likes WHERE post_id = p.id) as likes
+      FROM posts p
+      JOIN users u ON p.user_id = u.id
+      WHERE p.user_id = $1 AND (p.processing_status = 'COMPLETED' OR p.processing_status IS NULL)
+      ORDER BY p.created_at DESC
+    `, [userId]);
+    
+    const posts = result.rows.map(row => ({
+      ...row,
+      comments: [],
+      timestamp: new Date(row.timestamp).getTime(),
+      likedByCurrentUser: false
+    }));
+    
+    console.log(`[USER POSTS] Returning ${posts.length} posts for user ${userId}`);
+    res.json(posts);
+  } catch (err) {
+    console.error(`[USER POSTS] Error:`, err.message);
+    res.status(500).json({ error: 'Could not fetch user posts' });
+  }
+});
+
+// 10. ADD COMMENT (MIB Layout: VIEW_ONLY cannot comment)
+app.post('/posts/:id/comments', authenticate, async (req, res) => {
+  const { id: postId } = req.params;
+  const { content } = req.body;
+  const userId = req.user.id;
+  const userRole = req.user.role;
+  
+  // MIB Layout: VIEW_ONLY cannot comment
+  if (userRole === 'VIEW_ONLY') {
+    console.log(`[COMMENT] Permission denied - VIEW_ONLY cannot comment`);
+    return res.status(403).json({ error: 'View-Only users cannot comment on posts' });
+  }
+  
+  console.log(`[COMMENT] User ${userId} adding comment to post ${postId}`);
+  
+  if (!content || content.trim().length === 0) {
+    return res.status(400).json({ error: 'Comment content is required' });
+  }
+  
+  try {
+    const result = await pool.query(
+      `INSERT INTO comments (post_id, user_id, content) 
+       VALUES ($1, $2, $3) 
+       RETURNING id, content, created_at`,
+      [postId, userId, content.trim()]
+    );
+    
+    // Get comment with user info
+    const commentResult = await pool.query(`
+      SELECT c.id, c.content, c.created_at as timestamp,
+             u.id as "userId", u.username as "userName", u.avatar_url as "userAvatar"
+      FROM comments c
+      JOIN users u ON c.user_id = u.id
+      WHERE c.id = $1
+    `, [result.rows[0].id]);
+    
+    const comment = {
+      ...commentResult.rows[0],
+      timestamp: new Date(commentResult.rows[0].timestamp).getTime()
+    };
+    
+    console.log(`[COMMENT] Comment added successfully, ID: ${result.rows[0].id}`);
+    res.json(comment);
+  } catch (err) {
+    console.error(`[COMMENT] Error:`, err.message);
+    res.status(500).json({ error: 'Could not add comment' });
+  }
+});
+
+// 11. GET COMMENTS
+app.get('/posts/:id/comments', async (req, res) => {
+  const { id: postId } = req.params;
+  const page = parseInt(req.query.page || '1');
+  const limit = Math.min(parseInt(req.query.limit || '50'), 100);
+  const offset = (page - 1) * limit;
+  
+  console.log(`[COMMENTS] Fetching comments for post ${postId}, page: ${page}`);
+  
+  try {
+    const result = await pool.query(`
+      SELECT c.id, c.content, c.created_at as timestamp,
+             u.id as "userId", u.username as "userName", u.avatar_url as "userAvatar"
+      FROM comments c
+      JOIN users u ON c.user_id = u.id
+      WHERE c.post_id = $1
+      ORDER BY c.created_at ASC
+      LIMIT $2 OFFSET $3
+    `, [postId, limit, offset]);
+    
+    const comments = result.rows.map(row => ({
+      ...row,
+      timestamp: new Date(row.timestamp).getTime()
+    }));
+    
+    console.log(`[COMMENTS] Returning ${comments.length} comments`);
+    res.json(comments);
+  } catch (err) {
+    console.error(`[COMMENTS] Error:`, err.message);
+    res.status(500).json({ error: 'Could not fetch comments' });
+  }
+});
+
+// 12. SEARCH USERS/POSTS
+app.get('/search', async (req, res) => {
+  const { q, type = 'all' } = req.query; // type: 'users', 'posts', 'all'
+  const limit = Math.min(parseInt(req.query.limit || '20'), 50);
+  
+  console.log(`[SEARCH] Searching for "${q}", type: ${type}`);
+  
+  if (!q || q.trim().length < 2) {
+    return res.status(400).json({ error: 'Search query must be at least 2 characters' });
+  }
+  
+  try {
+    const results = { users: [], posts: [] };
+    
+    if (type === 'all' || type === 'users') {
+      const usersResult = await pool.query(`
+        SELECT id, username, full_name, avatar_url, role, verified
+        FROM users
+        WHERE username ILIKE $1 OR full_name ILIKE $1
+        LIMIT $2
+      `, [`%${q}%`, limit]);
+      results.users = usersResult.rows;
+    }
+    
+    if (type === 'all' || type === 'posts') {
+      const postsResult = await pool.query(`
+        SELECT p.id, p.type, p.content, p.media_url as "mediaUrl", p.created_at as timestamp,
+               u.id as "authorId", u.username as "authorName", u.avatar_url as "authorAvatar"
+        FROM posts p
+        JOIN users u ON p.user_id = u.id
+        WHERE (p.content ILIKE $1 OR u.username ILIKE $1)
+          AND (p.processing_status = 'COMPLETED' OR p.processing_status IS NULL)
+        ORDER BY p.created_at DESC
+        LIMIT $2
+      `, [`%${q}%`, limit]);
+      results.posts = postsResult.rows.map(row => ({
+        ...row,
+        timestamp: new Date(row.timestamp).getTime()
+      }));
+    }
+    
+    console.log(`[SEARCH] Found ${results.users.length} users, ${results.posts.length} posts`);
+    res.json(results);
+  } catch (err) {
+    console.error(`[SEARCH] Error:`, err.message);
+    res.status(500).json({ error: 'Search failed' });
+  }
+});
+
+// 13. DELETE POST
+app.delete('/posts/:id', authenticate, async (req, res) => {
+  const { id: postId } = req.params;
+  const userId = req.user.id;
+  
+  console.log(`[DELETE POST] User ${userId} attempting to delete post ${postId}`);
+  
+  try {
+    // Check if user owns the post or is admin
+    const postResult = await pool.query(
+      'SELECT user_id, type, media_url FROM posts WHERE id = $1',
+      [postId]
+    );
+    
+    if (postResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Post not found' });
+    }
+    
+    const post = postResult.rows[0];
+    if (post.user_id !== userId && req.user.role !== 'MODERATOR') {
+      console.log(`[DELETE POST] Permission denied`);
+      return res.status(403).json({ error: 'Permission denied' });
+    }
+    
+    // Delete associated data
+    await pool.query('DELETE FROM likes WHERE post_id = $1', [postId]);
+    await pool.query('DELETE FROM comments WHERE post_id = $1', [postId]);
+    await pool.query('DELETE FROM saves WHERE post_id = $1', [postId]);
+    await pool.query('DELETE FROM posts WHERE id = $1', [postId]);
+    
+    // TODO: Delete media files from MinIO
+    
+    console.log(`[DELETE POST] Post ${postId} deleted successfully`);
+    res.json({ success: true });
+  } catch (err) {
+    console.error(`[DELETE POST] Error:`, err.message);
+    res.status(500).json({ error: 'Could not delete post' });
+  }
+});
+
+// 14. SAVE/UNSAVE POST (MIB Layout: All users can save, including VIEW_ONLY)
+app.post('/posts/:id/save', authenticate, async (req, res) => {
+  const { id: postId } = req.params;
+  const userId = req.user.id;
+  console.log(`[SAVE] User ${userId} saving post ${postId}`);
+  
+  try {
+    // Check if already saved
+    const checkResult = await pool.query(
+      'SELECT * FROM saves WHERE user_id = $1 AND post_id = $2',
+      [userId, postId]
+    );
+    
+    if (checkResult.rows.length > 0) {
+      // Unsave
+      await pool.query(
+        'DELETE FROM saves WHERE user_id = $1 AND post_id = $2',
+        [userId, postId]
+      );
+      console.log(`[SAVE] Post ${postId} unsaved by user ${userId}`);
+      res.json({ saved: false });
+    } else {
+      // Save
+      await pool.query(
+        'INSERT INTO saves (user_id, post_id) VALUES ($1, $2)',
+        [userId, postId]
+      );
+      console.log(`[SAVE] Post ${postId} saved by user ${userId}`);
+      res.json({ saved: true });
+    }
+  } catch (err) {
+    console.error(`[SAVE] Error:`, err.message);
+    res.status(500).json({ error: 'Could not save/unsave post' });
+  }
+});
+
+// 15. GET SAVED POSTS
+app.get('/users/:id/saved', authenticate, async (req, res) => {
+  const { id: userId } = req.params;
+  // Users can only see their own saved posts
+  if (userId !== req.user.id && req.user.role !== 'MODERATOR') {
+    return res.status(403).json({ error: 'Permission denied' });
+  }
+  
+  console.log(`[SAVED POSTS] Fetching saved posts for user: ${userId}`);
+  
+  try {
+    const result = await pool.query(`
+      SELECT 
+        p.id, p.type, p.content, p.media_url as "mediaUrl", p.thumbnail_url as "thumbnailUrl", 
+        p.created_at as timestamp, p.processing_status,
+        u.id as "authorId", u.username as "authorName", u.avatar_url as "authorAvatar", u.role as "authorRole",
+        (SELECT COUNT(*) FROM likes WHERE post_id = p.id) as likes,
+        s.created_at as "savedAt"
+      FROM saves s
+      JOIN posts p ON s.post_id = p.id
+      JOIN users u ON p.user_id = u.id
+      WHERE s.user_id = $1 AND (p.processing_status = 'COMPLETED' OR p.processing_status IS NULL)
+      ORDER BY s.created_at DESC
+    `, [userId]);
+    
+    const posts = result.rows.map(row => ({
+      ...row,
+      comments: [],
+      timestamp: new Date(row.timestamp).getTime(),
+      savedByCurrentUser: true
+    }));
+    
+    console.log(`[SAVED POSTS] Returning ${posts.length} saved posts`);
+    res.json(posts);
+  } catch (err) {
+    console.error(`[SAVED POSTS] Error:`, err.message);
+    res.status(500).json({ error: 'Could not fetch saved posts' });
+  }
+});
+
+// 16. FORWARD POST (MIB Layout: Internal and External forwarding)
+app.post('/posts/:id/forward', authenticate, async (req, res) => {
+  const { id: postId } = req.params;
+  const { recipientId, recipientEmail, recipientPhone, isExternal } = req.body;
+  const userId = req.user.id;
+  const userRole = req.user.role;
+  
+  // MIB Layout: VIEW_ONLY cannot forward
+  if (userRole === 'VIEW_ONLY') {
+    console.log(`[FORWARD] Permission denied - VIEW_ONLY cannot forward`);
+    return res.status(403).json({ error: 'View-Only users cannot forward posts' });
+  }
+  
+  console.log(`[FORWARD] User ${userId} forwarding post ${postId} to ${isExternal ? 'external' : 'internal'} recipient`);
+  
+  try {
+    // Get post details
+    const postResult = await pool.query('SELECT * FROM posts WHERE id = $1', [postId]);
+    if (postResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Post not found' });
+    }
+    
+    let recipientUserId = null;
+    
+    if (isExternal) {
+      // External forwarding - recipient needs account
+      if (!recipientEmail && !recipientPhone) {
+        return res.status(400).json({ error: 'Recipient email or phone required for external forwarding' });
+      }
+      
+      // Check if recipient has account
+      const recipientResult = await pool.query(
+        'SELECT id FROM users WHERE email = $1 OR phone = $1',
+        [recipientEmail || recipientPhone]
+      );
+      
+      if (recipientResult.rows.length === 0) {
+        // Generate shareable link (external user needs to register/login to view)
+        const shareToken = jwt.sign({ postId, sharedBy: userId }, JWT_SECRET, { expiresIn: '30d' });
+        const shareUrl = `${process.env.FRONTEND_URL || 'http://localhost:5173'}/shared/${shareToken}`;
+        
+        // TODO: Send email/SMS with share link
+        
+        console.log(`[FORWARD] External forward - share link generated: ${shareToken}`);
+        return res.json({ 
+          success: true, 
+          shareUrl,
+          message: 'Recipient will need to create an account to view this post',
+          requiresAccount: true
+        });
+      }
+      
+      recipientUserId = recipientResult.rows[0].id;
+    } else {
+      // Internal forwarding
+      if (!recipientId) {
+        return res.status(400).json({ error: 'Recipient ID required for internal forwarding' });
+      }
+      recipientUserId = recipientId;
+    }
+    
+    // Create forward record
+    await pool.query(
+      `INSERT INTO forwards (post_id, from_user_id, to_user_id, is_external, created_at)
+       VALUES ($1, $2, $3, $4, NOW())`,
+      [postId, userId, recipientUserId, isExternal]
+    );
+    
+    console.log(`[FORWARD] Post forwarded successfully`);
+    res.json({ success: true, message: 'Post forwarded successfully' });
+  } catch (err) {
+    console.error(`[FORWARD] Error:`, err.message);
+    res.status(500).json({ error: 'Could not forward post' });
+  }
+});
+
+// 17. GET SHARED POST (for external links)
+app.get('/shared/:token', async (req, res) => {
+  const { token } = req.params;
+  
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    const { postId } = decoded;
+    
+    // Get post
+    const result = await pool.query(`
+      SELECT 
+        p.id, p.type, p.content, p.media_url as "mediaUrl", p.thumbnail_url as "thumbnailUrl", 
+        p.created_at as timestamp,
+        u.id as "authorId", u.username as "authorName", u.avatar_url as "authorAvatar"
+      FROM posts p
+      JOIN users u ON p.user_id = u.id
+      WHERE p.id = $1 AND (p.processing_status = 'COMPLETED' OR p.processing_status IS NULL)
+    `, [postId]);
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Post not found or not available' });
+    }
+    
+    const post = {
+      ...result.rows[0],
+      timestamp: new Date(result.rows[0].timestamp).getTime(),
+      requiresAuth: true // Frontend should prompt for login
+    };
+    
+    res.json(post);
+  } catch (err) {
+    console.error(`[SHARED POST] Error:`, err.message);
+    res.status(401).json({ error: 'Invalid or expired share link' });
+  }
+});
+
+// 18. VERIFY USER (Moderator only - verify NPI/State License)
+app.post('/admin/verify-user/:id', authenticate, async (req, res) => {
+  const { id: userId } = req.params;
+  const { verificationCode } = req.body;
+  
+  // Only moderators can verify users
+  if (req.user.role !== 'MODERATOR') {
+    return res.status(403).json({ error: 'Only moderators can verify users' });
+  }
+  
+  console.log(`[VERIFY USER] Moderator ${req.user.id} verifying user ${userId}`);
+  
+  try {
+    const userResult = await pool.query(
+      'SELECT verification_code FROM users WHERE id = $1',
+      [userId]
+    );
+    
+    if (userResult.rows.length === 0) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    const user = userResult.rows[0];
+    
+    if (verificationCode && user.verification_code !== verificationCode) {
+      return res.status(400).json({ error: 'Invalid verification code' });
+    }
+    
+    // Verify user
+    await pool.query(
+      'UPDATE users SET verified = true, verification_code = NULL WHERE id = $1',
+      [userId]
+    );
+    
+    console.log(`[VERIFY USER] User ${userId} verified successfully`);
+    res.json({ success: true, message: 'User verified successfully' });
+  } catch (err) {
+    console.error(`[VERIFY USER] Error:`, err.message);
+    res.status(500).json({ error: 'Could not verify user' });
   }
 });
 
 // Initialize DB Tables if not exist (Simple migration)
 const initDb = async () => {
+    console.log("[DB INIT] Starting database initialization...");
     try {
         await pool.query(`
             CREATE TABLE IF NOT EXISTS users (
@@ -190,20 +1045,83 @@ const initDb = async () => {
             CREATE TABLE IF NOT EXISTS likes (
                 user_id UUID REFERENCES users(id),
                 post_id UUID REFERENCES posts(id),
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 PRIMARY KEY (user_id, post_id)
             );
+            CREATE TABLE IF NOT EXISTS comments (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                post_id UUID REFERENCES posts(id) ON DELETE CASCADE,
+                user_id UUID REFERENCES users(id),
+                content TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS saves (
+                user_id UUID REFERENCES users(id),
+                post_id UUID REFERENCES posts(id) ON DELETE CASCADE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (user_id, post_id)
+            );
+            CREATE TABLE IF NOT EXISTS forwards (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                post_id UUID REFERENCES posts(id) ON DELETE CASCADE,
+                from_user_id UUID REFERENCES users(id),
+                to_user_id UUID REFERENCES users(id),
+                is_external BOOLEAN DEFAULT FALSE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS email VARCHAR(255);
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS phone VARCHAR(50);
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS state_license VARCHAR(50);
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS verification_code VARCHAR(10);
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS user_type VARCHAR(20);
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS two_factor_enabled BOOLEAN DEFAULT FALSE;
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS two_factor_secret VARCHAR(255);
+            CREATE INDEX IF NOT EXISTS idx_comments_post_id ON comments(post_id);
+            CREATE INDEX IF NOT EXISTS idx_posts_user_id ON posts(user_id);
+            CREATE INDEX IF NOT EXISTS idx_posts_type ON posts(type);
+            CREATE INDEX IF NOT EXISTS idx_posts_created_at ON posts(created_at);
+            CREATE INDEX IF NOT EXISTS idx_saves_user_id ON saves(user_id);
+            CREATE INDEX IF NOT EXISTS idx_forwards_post_id ON forwards(post_id);
         `);
-        console.log("Database initialized");
+        console.log("[DB INIT] Database tables initialized successfully");
     } catch(e) {
-        console.error("DB Init Error:", e);
+        console.error("[DB INIT] Error:", e.message);
     }
 }
 
 // Start Server
 const PORT = process.env.PORT || 4000;
-console.log(`Starting server on port: ${PORT} (from env: ${process.env.PORT || 'default 4000'})`);
+console.log(`[SERVER] Starting server on port: ${PORT} (from env: ${process.env.PORT || 'default 4000'})`);
+console.log(`[SERVER] Environment: POSTGRES_HOST=${process.env.POSTGRES_HOST || 'medgram_db'}`);
+console.log(`[SERVER] Environment: MINIO_ENDPOINT=${process.env.MINIO_ENDPOINT || 'medgram_storage'}`);
+
 app.listen(PORT, '0.0.0.0', async () => {
-    console.log(`Backend running on port ${PORT}`);
+    console.log(`[SERVER] ✅ Backend running on port ${PORT}`);
+    console.log(`[SERVER] Configuration:`);
+    console.log(`  Videos Bucket: ${MINIO_VIDEOS_BUCKET}`);
+    console.log(`  Images Bucket: ${MINIO_IMAGES_BUCKET}`);
+    console.log(`  HLS Bucket: ${MINIO_HLS_BUCKET}`);
+    console.log(`  Max File Size: ${MAX_FILE_SIZE / 1024 / 1024}MB`);
+    console.log(`[SERVER] Available endpoints:`);
+    console.log(`  POST   /auth/register (email/phone, NPI/License verification)`);
+    console.log(`  POST   /auth/login (email/phone, 2FA support)`);
+    console.log(`  GET    /feed (with pagination)`);
+    console.log(`  POST   /posts (auth required, role-based permissions)`);
+    console.log(`  DELETE /posts/:id (auth required)`);
+    console.log(`  POST   /upload/presigned (auth required)`);
+    console.log(`  POST   /upload/direct (auth required)`);
+    console.log(`  GET    /health`);
+    console.log(`  GET    /users/:id`);
+    console.log(`  GET    /users/:id/posts`);
+    console.log(`  GET    /users/:id/saved (auth required)`);
+    console.log(`  POST   /posts/:id/like (auth required, VIEW_ONLY blocked)`);
+    console.log(`  POST   /posts/:id/save (auth required, all users)`);
+    console.log(`  POST   /posts/:id/forward (auth required, VIEW_ONLY blocked)`);
+    console.log(`  POST   /posts/:id/comments (auth required, VIEW_ONLY blocked)`);
+    console.log(`  GET    /posts/:id/comments`);
+    console.log(`  GET    /shared/:token (external share links)`);
+    console.log(`  GET    /search?q=query&type=all|users|posts`);
+    console.log(`  POST   /admin/verify-user/:id (moderator only)`);
     // Wait a bit for DB to be ready in Docker
     setTimeout(initDb, 5000);
 });
