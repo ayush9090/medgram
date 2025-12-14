@@ -1,11 +1,31 @@
-<div align="center">
 
-<img width="1200" height="475" alt="GHBanner" src="https://github.com/user-attachments/assets/0aa67016-6eaf-458a-adb2-6e31a0763ed6" />
+# MedGram Deployment Guide
 
-  <h1>Built with AI Studio</h2>
+## How to Deploy on Portainer
 
-  <p>The fastest path from prompt to production with Gemini.</p>
+**IMPORTANT:** You cannot deploy this stack using the Portainer "Web Editor" because it requires building custom Docker images from the `backend/` source code.
 
-  <a href="https://aistudio.google.com/apps">Start building</a>
+### Step 1: Create a Git Repository
+1. Initialize a Git repository in this folder.
+2. Commit all files (`docker-compose.yml`, `backend/`, etc.).
+3. Push to GitHub, GitLab, or Bitbucket.
 
-</div>
+### Step 2: Deploy in Portainer
+1. Log in to Portainer.
+2. Go to **Stacks** > **Add stack**.
+3. Select **Repository** (NOT Web editor).
+4. **Repository URL:** Paste the URL of your git repo (e.g., `https://github.com/yourname/medgram.git`).
+5. **Compose path:** Keep as `docker-compose.yml`.
+6. Click **Deploy the stack**.
+
+Portainer will now pull your code, build the `medgram_backend` image using the `backend/Dockerfile`, and start the services.
+
+## Architecture
+- **PostgreSQL:** Database on port 5432.
+- **MinIO:** Object storage (S3 compatible) on ports 9000/9001.
+- **Backend API:** Node.js/Express on port 3000.
+- **Worker:** Background service for HLS video transcoding.
+
+## Environment Variables
+The stack uses the following default configuration (defined in `docker-compose.yml`).
+Update `MINIO_PUBLIC_URL` to match your server IP if it changes.

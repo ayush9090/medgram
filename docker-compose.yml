@@ -1,0 +1,113 @@
+
+version: '3.8'
+
+# -----------------------------------------------------------------------------
+# DEPLOYMENT OPTIONS:
+#
+# OPTION 1 (RECOMMENDED): Git Repository Method
+# 1. Push this entire project to a Git repository (GitHub/GitLab).
+# 2. In Portainer, use "Add Stack" -> "Repository" and paste your Repo URL.
+#
+# OPTION 2: Web Editor Method (requires backend files)
+# If using Portainer's Web Editor, you must upload the entire project
+# including the backend/ directory. The build context is set to the root (.)
+# to work with Portainer's file structure.
+# -----------------------------------------------------------------------------
+
+services:
+  # 1. PostgreSQL Database
+  medgram_db:
+    image: postgres:15-alpine
+    container_name: medgram_db
+    environment:
+      POSTGRES_USER: medgram_admin
+      POSTGRES_PASSWORD: secure_password_change_me
+      POSTGRES_DB: medgram_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U medgram_admin -d medgram_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # 2. MinIO Object Storage
+  medgram_storage:
+    image: minio/minio
+    container_name: medgram_storage
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minio_admin
+      MINIO_ROOT_PASSWORD: secure_minio_password_change_me
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+
+  # 3. Setup MinIO Buckets
+  create-buckets:
+    image: minio/mc
+    depends_on:
+      medgram_storage:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      /usr/bin/mc alias set myminio http://medgram_storage:9000 minio_admin secure_minio_password_change_me;
+      /usr/bin/mc mb myminio/videos;
+      /usr/bin/mc mb myminio/hls;
+      /usr/bin/mc anonymous set public myminio/videos;
+      /usr/bin/mc anonymous set public myminio/hls;
+      exit 0;
+      "
+
+  # 4. API Backend
+  medgram_backend:
+    build: 
+      context: .
+      dockerfile: ./backend/Dockerfile
+    container_name: medgram_backend
+    restart: always
+    environment:
+      POSTGRES_HOST: medgram_db
+      MINIO_ENDPOINT: medgram_storage
+      # Points to your server IP so devices can access media
+      MINIO_PUBLIC_URL: http://74.208.158.126:9000
+    ports:
+      - "3000:3000"
+    depends_on:
+      medgram_db:
+        condition: service_healthy
+      medgram_storage:
+        condition: service_healthy
+
+  # 5. Video Processing Worker
+  medgram_worker:
+    build: 
+      context: .
+      dockerfile: ./backend/Dockerfile
+    container_name: medgram_worker
+    restart: always
+    command: ["npm", "run", "worker"]
+    environment:
+      POSTGRES_HOST: medgram_db
+      MINIO_ENDPOINT: medgram_storage
+      MINIO_PUBLIC_URL: http://74.208.158.126:9000
+    depends_on:
+      medgram_db:
+        condition: service_healthy
+      medgram_storage:
+        condition: service_healthy
+      medgram_backend:
+        condition: service_started
+
+volumes:
+  postgres_data:
+  minio_data:
