@@ -23,10 +23,12 @@ services:
       POSTGRES_USER: medgram_admin
       POSTGRES_PASSWORD: secure_password_change_me
       POSTGRES_DB: medgram_db
-    # Port removed for security - only accessible within Docker network
+    # Port not exposed - access via nginx proxy or internal Docker network
     # Backend and worker can access via service name 'medgram_db' on port 5432
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    networks:
+      - medgram_network
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U medgram_admin -d medgram_db"]
       interval: 5s
@@ -46,6 +48,8 @@ services:
       - "9001:9001"
     volumes:
       - minio_data:/data
+    networks:
+      - medgram_network
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
       interval: 30s
@@ -102,6 +106,8 @@ services:
       MINIO_PUBLIC_URL: http://74.208.158.126:9000
     ports:
       - "3000:3000"
+    networks:
+      - medgram_network
     depends_on:
       medgram_db:
         condition: service_healthy
@@ -120,6 +126,8 @@ services:
       POSTGRES_HOST: medgram_db
       MINIO_ENDPOINT: medgram_storage
       MINIO_PUBLIC_URL: http://74.208.158.126:9000
+    networks:
+      - medgram_network
     depends_on:
       medgram_db:
         condition: service_healthy
@@ -127,6 +135,26 @@ services:
         condition: service_healthy
       medgram_backend:
         condition: service_started
+
+  # 6. Frontend Web Application
+  medgram_frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    container_name: medgram_frontend
+    restart: always
+    ports:
+      - "80:80"
+    networks:
+      - medgram_network
+    depends_on:
+      medgram_backend:
+        condition: service_started
+
+networks:
+  medgram_network:
+    name: medgram_network
+    driver: bridge
 
 volumes:
   postgres_data:
