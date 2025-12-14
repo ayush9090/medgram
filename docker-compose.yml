@@ -60,11 +60,31 @@ services:
         condition: service_healthy
     entrypoint: >
       /bin/sh -c "
-      /usr/bin/mc alias set myminio http://medgram_storage:9000 minio_admin secure_minio_password_change_me;
-      /usr/bin/mc mb myminio/videos;
-      /usr/bin/mc mb myminio/hls;
-      /usr/bin/mc anonymous set public myminio/videos;
-      /usr/bin/mc anonymous set public myminio/hls;
+      echo 'Waiting for MinIO to be fully ready...';
+      sleep 3;
+      echo 'Setting up MinIO alias...';
+      MAX_RETRIES=10;
+      RETRY=0;
+      while [ $RETRY -lt $MAX_RETRIES ]; do
+        if /usr/bin/mc alias set myminio http://medgram_storage:9000 minio_admin secure_minio_password_change_me 2>&1; then
+          echo 'Alias set successfully!';
+          break;
+        else
+          RETRY=$((RETRY+1));
+          echo \"Retry $RETRY/$MAX_RETRIES: Waiting for MinIO...\";
+          sleep 2;
+        fi;
+      done;
+      if [ $RETRY -eq $MAX_RETRIES ]; then
+        echo 'WARNING: Failed to set alias after retries, but continuing...';
+      fi;
+      echo 'Creating buckets...';
+      /usr/bin/mc mb myminio/videos 2>/dev/null || echo 'Bucket videos already exists';
+      /usr/bin/mc mb myminio/hls 2>/dev/null || echo 'Bucket hls already exists';
+      echo 'Setting bucket permissions...';
+      /usr/bin/mc anonymous set public myminio/videos 2>/dev/null || echo 'Note: videos permission may already be set';
+      /usr/bin/mc anonymous set public myminio/hls 2>/dev/null || echo 'Note: hls permission may already be set';
+      echo 'Bucket setup completed!';
       exit 0;
       "
 
@@ -111,3 +131,4 @@ services:
 volumes:
   postgres_data:
   minio_data:
+
