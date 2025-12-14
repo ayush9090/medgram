@@ -84,9 +84,11 @@ services:
       fi;
       echo 'Creating buckets...';
       /usr/bin/mc mb myminio/videos 2>/dev/null || echo 'Bucket videos already exists';
+      /usr/bin/mc mb myminio/images 2>/dev/null || echo 'Bucket images already exists';
       /usr/bin/mc mb myminio/hls 2>/dev/null || echo 'Bucket hls already exists';
       echo 'Setting bucket permissions...';
       /usr/bin/mc anonymous set public myminio/videos 2>/dev/null || echo 'Note: videos permission may already be set';
+      /usr/bin/mc anonymous set public myminio/images 2>/dev/null || echo 'Note: images permission may already be set';
       /usr/bin/mc anonymous set public myminio/hls 2>/dev/null || echo 'Note: hls permission may already be set';
       echo 'Bucket setup completed!';
       exit 0;
@@ -105,6 +107,15 @@ services:
       PORT: 4000
       # Points to your server IP so devices can access media
       MINIO_PUBLIC_URL: http://74.208.158.126:9000
+      # Email Configuration (configure these for email authentication)
+      # For Gmail: Use App Password (NOT regular password)
+      # Get App Password: https://myaccount.google.com/apppasswords
+      SMTP_HOST: ${SMTP_HOST:-smtp.gmail.com}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER:-avariyava@gmail.com}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-ybobvaqrrtaljzan}
+      SMTP_FROM: ${SMTP_FROM:-avariyava@gmail.com}
+      FRONTEND_URL: ${FRONTEND_URL:-http://74.208.158.126:5173}
     ports:
       - "4000:4000"
     networks:
