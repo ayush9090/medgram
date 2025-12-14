@@ -136,20 +136,20 @@ services:
       medgram_backend:
         condition: service_started
 
-  # 6. Frontend Web Application
-  medgram_frontend:
-    build:
-      context: .
-      dockerfile: Dockerfile.frontend
-    container_name: medgram_frontend
-    restart: always
-    ports:
-      - "80:80"
-    networks:
-      - medgram_network
-    depends_on:
-      medgram_backend:
-        condition: service_started
+  # 6. Frontend Web Application (commented out - uncomment after adding Dockerfile.frontend to Git)
+  # medgram_frontend:
+  #   build:
+  #     context: .
+  #     dockerfile: Dockerfile.frontend
+  #   container_name: medgram_frontend
+  #   restart: always
+  #   ports:
+  #     - "80:80"
+  #   networks:
+  #     - medgram_network
+  #   depends_on:
+  #     medgram_backend:
+  #       condition: service_started
 
 networks:
   medgram_network:
